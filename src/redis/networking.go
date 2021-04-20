@@ -76,6 +76,27 @@ func processInputBuffer(client *redisClient) {
 	}
 }
 
+func addReplyLongLong(client *redisClient, ll int64) {
+	if ll == 0 {
+		addReply(client, shared.czero)
+	} else if ll == 1 {
+		addReply(client, shared.cone)
+	} else {
+		addReplyLongLongWithPrefix(client, ll, ":")
+	}
+
+}
+
+func addReplyLongLongWithPrefix(client *redisClient, ll int64, prefix string) {
+	output := prefix + strconv.FormatInt(ll, 10) + "\r\n"
+	addReplyString(client, output)
+}
+
+func addReplyString(client *redisClient, str string) {
+	addReplyToBuffer(client, sds(str))
+	sendReplyToClient(client)
+}
+
 func addReplyBulkLen(client *redisClient, obj *robj) {
 	bulkLen := "$" + strconv.Itoa(len(obj.ptr.(sds))) + "\r\n"
 	addReply(client, createObject(redisString, sds(bulkLen)))

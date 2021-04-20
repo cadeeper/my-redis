@@ -7,17 +7,17 @@ import (
 	"time"
 )
 
-var (
+const (
 	redisOk  = 0
 	redisErr = -1
 )
 
 //client flags
-var (
+const (
 	redisCloseAfterReply = 1 << 6
 )
 
-var (
+const (
 	redisLruClockResolution = 1000
 	redisLruBits            = 24
 	redisLruClockMax        = 1<<redisLruBits - 1
@@ -33,13 +33,18 @@ var (
 
 	redisMaxWritePerEvent = 1024 * 64
 
-	shared *sharedObjectsStruct
+	activeExpireCycleLookupsPerLoop = 20
+	activeExpireCycleSlowTimeperc   = 25
 )
 
 var (
+	shared *sharedObjectsStruct
+
 	redisCommandTable = []*redisCommand{
 		{sds("get"), getCommand},
 		{sds("set"), setCommand},
+		{sds("expire"), expireCommand},
+		{sds("ttl"), ttlCommand},
 	}
 )
 
@@ -47,6 +52,7 @@ var (
 type redisServer struct {
 	pid int //pid
 
+	hz       int      //hz
 	db       *redisDb //db
 	commands *dict    //redis命令字典，key = sds(命令，比如get/set)， value = *redisCommand
 
@@ -95,12 +101,15 @@ type sharedObjectsStruct struct {
 	err       *robj
 	syntaxerr *robj
 	nullbulk  *robj
+	czero     *robj
+	cone      *robj
 }
 
 //初始化server配置
 func initServerConfig() {
 	server.port = redisServerPort
 	server.tcpBacklog = redisTcpBacklog
+	server.hz = 10
 	server.events = &eventloop{}
 	populateCommandTable()
 }
@@ -121,10 +130,9 @@ func initServer() {
 	//初始化事件处理器
 	server.events.react = dataHandler
 	server.events.accept = acceptHandler
-
-	//if server.ipfd == nil {
-	//	os.Exit(1)
-	//}
+	server.events.tick = func() (delay time.Duration, action gnet.Action) {
+		return serverCron(), action
+	}
 
 	//初始化db
 	server.db = &redisDb{
@@ -176,8 +184,12 @@ func lruClock() uint32 {
 	return server.lruclock
 }
 
-func mstime() uint64 {
-	return uint64(time.Now().UnixNano() / 1000 / 1000)
+func mstime() int64 {
+	return int64(time.Now().UnixNano() / 1000 / 1000)
+}
+
+func ustime() int64 {
+	return int64(time.Now().UnixNano() / 1000)
 }
 
 func generateClientId() int {
@@ -192,6 +204,8 @@ func createSharedObjects() {
 		err:       createObject(redisString, sds("-ERR\r\n")),
 		syntaxerr: createObject(redisString, sds("-ERR syntax error\r\n")),
 		nullbulk:  createObject(redisString, sds("$-1\r\n")),
+		czero:     createObject(redisString, sds(":0\r\n")),
+		cone:      createObject(redisString, sds(":1\r\n")),
 	}
 }
 
@@ -201,6 +215,88 @@ func populateCommandTable() {
 		server.commands.dictAdd(c.name, c)
 	}
 	log.Printf("populateCommandTable successfully: %v", server.commands)
+}
+
+func serverCron() time.Duration {
+	databasesCron()
+	return time.Millisecond * time.Duration(1000/server.hz)
+}
+
+//db的后台定时任务
+func databasesCron() {
+
+	activeExpireCycle()
+
+	//TODO 后续RDB或AOF的情况需要做其它处理
+}
+
+func activeExpireCycle() {
+	//目前我们只有一个DB，就不需要循环处理DB了
+	//多DB的情况下最外层应该还有一层循环： for db in server.dbs {}
+
+	//记录开始时间
+	start := ustime()
+
+	//每个DB的最长执行时间限制
+	timelimit := int64(1000000 * activeExpireCycleSlowTimeperc / server.hz / 100)
+
+	if timelimit <= 0 {
+		timelimit = 1
+	}
+	db := server.db
+	for {
+		nums := 0
+		expired := 0
+		now := mstime()
+		//过期字典的大小
+		nums = db.expires.used()
+		if nums == 0 {
+			break
+		}
+
+		//TODO 如果过期字典的大小小于容量的1%，则不处理。
+
+		//最大为20
+		if nums > activeExpireCycleLookupsPerLoop {
+			nums = activeExpireCycleLookupsPerLoop
+		}
+
+		for ; nums > 0; nums = nums - 1 {
+
+			//随机获取一个key
+			de := db.expires.getRandomKey()
+			if de == nil {
+				break
+			}
+
+			//将key过期
+			if activeExpireCycleTryExpire(db, de, now) {
+				expired++
+			}
+		}
+
+		//执行时长
+		elapsed := ustime() - start
+
+		if elapsed > timelimit {
+			break
+		}
+		if expired < activeExpireCycleLookupsPerLoop/4 {
+			break
+		}
+	}
+}
+
+func activeExpireCycleTryExpire(db *redisDb, key *robj, now int64) bool {
+	t := db.expires.dictFind(key.ptr)
+	if t == nil {
+		return false
+	}
+	if now > t.(int64) {
+		db.dbDelete(key)
+		return true
+	}
+	return false
 }
 
 func Start() {

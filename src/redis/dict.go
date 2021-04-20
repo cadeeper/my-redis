@@ -1,5 +1,11 @@
 package redis
 
+import (
+	"github.com/lukechampine/randmap/safe"
+	"log"
+	"unsafe"
+)
+
 var (
 	dictOk  = 0
 	dictErr = 1
@@ -37,6 +43,31 @@ func (d dict) dictReplace(key interface{}, val interface{}) int {
 }
 
 //从dict中删除元素
-func (d dict) dictDelete(key interface{}) {
+func (d dict) dictDelete(key interface{}) int {
+	if _, ok := d[key]; !ok {
+		return dictErr
+	}
 	delete(d, key)
+	return dictOk
+}
+
+func (d dict) getRandomKey() (o *robj) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Print(err)
+			o = nil
+		}
+	}()
+	de := randmap.Key(d)
+	return createObject(redisString, de.(sds))
+}
+
+func (d dict) used() int {
+	return len(d)
+}
+
+func (d dict) size() int {
+	point := (**hmap)(unsafe.Pointer(&d))
+	value := *point
+	return int(6.5 * float32(uintptr(1)<<value.B))
 }

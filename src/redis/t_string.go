@@ -5,13 +5,13 @@ import (
 	"strconv"
 )
 
-var (
+const (
 	redisSetNoFlag = 0
 	redisSetNx     = 1 << 0
 	redisSetXx     = 1 << 1
 
-	unitSeconds      uint64 = 0
-	unitMilliseconds uint64 = 1
+	unitSeconds      int = 0
+	unitMilliseconds int = 1
 )
 
 //SET key value [NX] [XX] [EX <seconds>] [PX <milliseconds>]
@@ -69,11 +69,11 @@ func getGenericCommand(client *redisClient) int {
 	}
 }
 
-func setGenericCommand(client *redisClient, flags int, key *robj, val *robj, expire *robj, unit uint64) {
-	var milliseconds uint64 = 0
+func setGenericCommand(client *redisClient, flags int, key *robj, val *robj, expire *robj, unit int) {
+	var milliseconds int64 = 0
 	if expire != nil {
 		imsstr, _ := strconv.Atoi(string(expire.ptr.(sds)))
-		milliseconds = uint64(imsstr)
+		milliseconds = int64(imsstr)
 		if milliseconds < 0 {
 			addReply(client, shared.err)
 			return
