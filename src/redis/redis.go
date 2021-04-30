@@ -131,6 +131,8 @@ func initServerConfig() {
 	server.hz = 10
 	server.events = &eventloop{}
 	server.maxMemorySamples = redisDefaultMaxMemorySamples
+	server.maxMemoryPolicy = redisMaxMemoryAllKeysLru
+	server.maxMemory = 10
 	populateCommandTable()
 }
 
@@ -387,7 +389,7 @@ func freeMemoryIfNeeded() int {
 		} else if server.maxMemoryPolicy == redisMaxMemoryAllKeysLru ||
 			server.maxMemoryPolicy == redisMaxMemoryVolatileLru {
 			//LRU淘汰
-			for bestKey != nil {
+			for bestKey == nil {
 				pool := server.db.evictionPool
 				evictionPoolPopulate(dt, server.db.dict, pool)
 
@@ -455,7 +457,7 @@ func evictionPoolPopulate(sampleDict *dict, keyDict *dict, pool []*evictionPoolE
 		idle := estimateObjectIdleTime(o)
 
 		k := 0
-		for k < redisEvictionPoolSize && len(pool[k].key) == 0 && pool[k].idle < idle {
+		for k < redisEvictionPoolSize && len(pool[k].key) != 0 && pool[k].idle < idle {
 			k++
 		}
 
@@ -494,8 +496,10 @@ func estimateObjectIdleTime(o *robj) uint64 {
 }
 
 func usedMemory() uint64 {
-	//TODO  没有手动分配内存，暂时无法获取
-	return 0
+	//TODO  没有手动分配内存，暂时无法获取 模拟使用redis的key
+	used := uint64(server.db.dict.used() + server.db.expires.used())
+	log.Printf("used memory is : %v", used)
+	return used
 }
 
 func Start() {
