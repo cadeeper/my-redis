@@ -62,6 +62,15 @@ func (d dict) getRandomKey() (o *robj) {
 	return createObject(redisString, de.(sds))
 }
 
+func (d dict) getSomeKeys(n int) dict {
+	ret := make(dict, n)
+	for i := 0; i < n; i++ {
+		k := randmap.Key(d)
+		ret.dictAdd(k, d.dictFind(k))
+	}
+	return ret
+}
+
 func (d dict) used() int {
 	return len(d)
 }

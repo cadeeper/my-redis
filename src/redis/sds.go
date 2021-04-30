@@ -1,3 +1,3 @@
 package redis
 
-type sds string
+type sds = string

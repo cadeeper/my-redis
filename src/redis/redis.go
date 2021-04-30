@@ -35,6 +35,18 @@ const (
 
 	activeExpireCycleLookupsPerLoop = 20
 	activeExpireCycleSlowTimeperc   = 25
+
+	redisDefaultMaxMemorySamples = 5
+)
+
+const (
+	redisMaxMemoryVolatileLru    = 0
+	redisMaxMemoryVolatileTtl    = 1
+	redisMaxMemoryVolatileRandom = 2
+	redisMaxMemoryAllKeysLru     = 3
+	redisMaxMemoryAllKeysRandom  = 4
+	redisMaxMemoryNoEviction     = 5
+	redisDefaultMaxMemoryPolicy  = redisMaxMemoryNoEviction
 )
 
 var (
@@ -65,7 +77,13 @@ type redisServer struct {
 
 	events *eventloop //事件处理器
 
-	lruclock uint32
+	lruclock uint64
+
+	//limits
+	maxClients       uint   //max number of simultaneous clients
+	maxMemory        uint64 //max number of memory bytes to use
+	maxMemoryPolicy  int    //policy for key eviction
+	maxMemorySamples int
 }
 
 type redisClient struct {
@@ -103,6 +121,7 @@ type sharedObjectsStruct struct {
 	nullbulk  *robj
 	czero     *robj
 	cone      *robj
+	oomerr    *robj
 }
 
 //初始化server配置
@@ -111,6 +130,7 @@ func initServerConfig() {
 	server.tcpBacklog = redisTcpBacklog
 	server.hz = 10
 	server.events = &eventloop{}
+	server.maxMemorySamples = redisDefaultMaxMemorySamples
 	populateCommandTable()
 }
 
@@ -136,12 +156,24 @@ func initServer() {
 
 	//初始化db
 	server.db = &redisDb{
-		dict:    &dict{},
-		expires: &dict{},
-		id:      1,
+		dict:         &dict{},
+		expires:      &dict{},
+		evictionPool: evictionPoolAlloc(),
+		id:           1,
 	}
 
 	createSharedObjects()
+}
+
+func evictionPoolAlloc() []*evictionPoolEntry {
+	pool := make([]*evictionPoolEntry, redisEvictionPoolSize)
+	for i := 0; i < redisEvictionPoolSize; i++ {
+		pool[i] = &evictionPoolEntry{
+			idle: 0,
+			key:  "",
+		}
+	}
+	return pool
 }
 
 //处理命令
@@ -161,6 +193,15 @@ func processCommand(client *redisClient) int {
 		addReply(client, shared.err)
 		return redisOk
 	}
+
+	if server.maxMemory > 0 {
+		ret := freeMemoryIfNeeded()
+		if ret == redisErr {
+			addReply(client, shared.oomerr)
+			return redisOk
+		}
+	}
+
 	call(client, 0)
 	return redisOk
 }
@@ -180,8 +221,15 @@ func call(client *redisClient, flag int) {
 	client.cmd.redisCommandFunc(client)
 }
 
-func lruClock() uint32 {
-	return server.lruclock
+func lruClock() uint64 {
+	if 1000/server.hz <= redisLruClockResolution {
+		return server.lruclock
+	}
+	return getLruClock()
+}
+
+func getLruClock() uint64 {
+	return uint64(mstime() / redisLruClockResolution & redisLruClockMax)
 }
 
 func mstime() int64 {
@@ -206,6 +254,7 @@ func createSharedObjects() {
 		nullbulk:  createObject(redisString, sds("$-1\r\n")),
 		czero:     createObject(redisString, sds(":0\r\n")),
 		cone:      createObject(redisString, sds(":1\r\n")),
+		oomerr:    createObject(redisString, sds("-OOM command not allowed when used memory > 'maxmemory'.\r\n")),
 	}
 }
 
@@ -218,6 +267,7 @@ func populateCommandTable() {
 }
 
 func serverCron() time.Duration {
+	server.lruclock = getLruClock()
 	databasesCron()
 	return time.Millisecond * time.Duration(1000/server.hz)
 }
@@ -297,6 +347,155 @@ func activeExpireCycleTryExpire(db *redisDb, key *robj, now int64) bool {
 		return true
 	}
 	return false
+}
+
+func freeMemoryIfNeeded() int {
+	memUsed := usedMemory()
+	//TODO 这里需要移除AOF和slave的buffer才是真实的占用内存
+	//to something
+
+	if memUsed <= server.maxMemory {
+		return redisOk
+	}
+
+	//淘汰策略不允许释放内存，返回err
+	if server.maxMemoryPolicy == redisMaxMemoryNoEviction {
+		return redisErr
+	}
+
+	memToFree := memUsed - server.maxMemory
+	var memFreed uint64 = 0
+	for memFreed < memToFree {
+
+		var dt *dict
+		var bestKey *robj
+		var bestVal int64
+
+		if server.maxMemoryPolicy == redisMaxMemoryAllKeysLru ||
+			server.maxMemoryPolicy == redisMaxMemoryAllKeysRandom {
+			dt = server.db.dict
+		} else {
+			dt = server.db.expires
+		}
+		if server.maxMemoryPolicy == redisMaxMemoryAllKeysRandom ||
+			server.maxMemoryPolicy == redisMaxMemoryVolatileRandom {
+			//随机淘汰
+			val := dt.getRandomKey()
+			if val != nil {
+				bestKey = val
+			}
+		} else if server.maxMemoryPolicy == redisMaxMemoryAllKeysLru ||
+			server.maxMemoryPolicy == redisMaxMemoryVolatileLru {
+			//LRU淘汰
+			for bestKey != nil {
+				pool := server.db.evictionPool
+				evictionPoolPopulate(dt, server.db.dict, pool)
+
+				for k := redisEvictionPoolSize - 1; k >= 0; k-- {
+					//从后往前遍历，空间时间长的往短的
+					if len(pool[k].key) == 0 {
+						continue
+					}
+					val := dt.dictFind(pool[k].key).(*robj)
+					//释放pool对象
+					//sdsfree(pool[k].key)
+					//模拟
+					pool[k].key = ""
+					//链表元素的右边全部左移，如果是最后一个元素不需要移动
+					if k < redisEvictionPoolSize-1 {
+						copy(pool[k:], pool[k+1:])
+					}
+					//左移后最后一个元素重新初始化
+					pool[redisEvictionPoolSize-1].key = ""
+					pool[redisEvictionPoolSize-1].idle = 0
+
+					if val != nil {
+						bestKey = val
+						break
+					}
+				}
+			}
+		} else if server.maxMemoryPolicy == redisMaxMemoryVolatileTtl {
+			//TTL淘汰
+			for k := 0; k < server.maxMemorySamples; k++ {
+				key := dt.getRandomKey()
+				val := dt.dictFind(key.ptr).(int64)
+
+				if bestKey != nil || val < bestVal {
+					bestKey = key
+					bestVal = val
+				}
+			}
+		}
+
+		if bestKey != nil {
+			//free memory
+			delta := usedMemory()
+			server.db.dbDelete(bestKey)
+			delta -= usedMemory()
+			memFreed += delta
+		}
+	}
+	return redisOk
+}
+
+func evictionPoolPopulate(sampleDict *dict, keyDict *dict, pool []*evictionPoolEntry) {
+	//sampleCount := 16
+	//if server.maxMemorySamples <= sampleCount {
+	//}
+	samples := sampleDict.getSomeKeys(server.maxMemorySamples)
+	var o *robj
+	for k, v := range samples {
+		o = v.(*robj)
+		key := k.(sds)
+		if sampleDict != keyDict {
+			//sampledict是过期字典，要重新从数据字典中拿到value
+			o = keyDict.dictFind(k).(*robj)
+		}
+		idle := estimateObjectIdleTime(o)
+
+		k := 0
+		for k < redisEvictionPoolSize && len(pool[k].key) == 0 && pool[k].idle < idle {
+			k++
+		}
+
+		if k == 0 && len(pool[redisEvictionPoolSize-1].key) != 0 {
+			//key的空闲时间比淘汰池中最短的还要短，并且淘汰池已满，跳过这个key
+			continue
+		} else if k < redisEvictionPoolSize && len(pool[k].key) == 0 {
+			//不处理，k还没有值，可以直接插入
+		} else {
+			//需要在链表中插入k
+			if len(pool[redisEvictionPoolSize-1].key) == 0 {
+				//未满，后移
+				copy(pool[k+1:], pool[k:])
+			} else {
+				//满了，前移
+				//free(pool[0])
+				pool[0].key = ""
+				k--
+				copy(pool[:k-1], pool[1:k])
+			}
+		}
+		pool[k].key = key
+		pool[k].idle = idle
+	}
+	//free samples
+	samples = nil
+}
+
+func estimateObjectIdleTime(o *robj) uint64 {
+	lruclock := lruClock()
+	if lruclock >= o.lru {
+		return (lruclock - o.lru) * redisLruClockResolution
+	}
+	//clock已经走了一圈了
+	return (lruclock + (redisLruClockMax - o.lru)) * redisLruClockResolution
+}
+
+func usedMemory() uint64 {
+	//TODO  没有手动分配内存，暂时无法获取
+	return 0
 }
 
 func Start() {

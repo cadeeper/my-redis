@@ -3,7 +3,7 @@ package redis
 type robj struct {
 	rtype    uint8
 	encoding uint8
-	lru      uint32
+	lru      uint64
 	refcount int
 	ptr      interface{}
 }

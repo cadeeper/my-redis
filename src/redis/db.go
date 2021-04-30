@@ -2,11 +2,22 @@ package redis
 
 import "strconv"
 
+const (
+	redisEvictionPoolSize = 16
+)
+
+type evictionPoolEntry struct {
+	idle uint64
+	key  sds
+}
+
 //存储数据结构
 type redisDb struct {
 	dict    *dict //dict，用来存储k-v数据， key = *robj, value = *robj
 	expires *dict //expires，用来存储带有过期时间的键， key = *robj, value = timestamp
 	id      int   //id
+
+	evictionPool []*evictionPoolEntry
 }
 
 func (r *redisDb) setKey(key *robj, val *robj) {
